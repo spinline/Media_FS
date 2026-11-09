@@ -31,6 +31,9 @@ type Cache struct {
 }
 
 func cacheDir() string {
+	if d := os.Getenv("MEDIAFS_CACHE_DIR"); d != "" {
+		return d
+	}
 	if runtime.GOOS == "windows" {
 		return filepath.Join(os.Getenv("APPDATA"), "MediaFS")
 	}
@@ -38,7 +41,7 @@ func cacheDir() string {
 	return filepath.Join(home, ".cache", "mediafs")
 }
 
-// Open opens (or creates) the cache database (artwork only).
+// Open opens (or creates) the cache database.
 func Open(ttlItems, ttlMetadata, ttlArtwork time.Duration) (*Cache, error) {
 	dir := cacheDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -70,15 +73,31 @@ func (c *Cache) migrate() error {
 			expires_at INTEGER NOT NULL,
 			PRIMARY KEY (server_key, item_id, art_type)
 		);
+		CREATE TABLE IF NOT EXISTS items (
+			server_key TEXT NOT NULL,
+			parent_id  TEXT NOT NULL,
+			data       BLOB NOT NULL,
+			expires_at INTEGER NOT NULL,
+			PRIMARY KEY (server_key, parent_id)
+		);
+		CREATE TABLE IF NOT EXISTS metadata (
+			server_key TEXT NOT NULL,
+			item_id    TEXT NOT NULL,
+			data       BLOB NOT NULL,
+			expires_at INTEGER NOT NULL,
+			PRIMARY KEY (server_key, item_id)
+		);
 	`)
 	return err
 }
 
-// --- Items (in-memory only) ---
+// --- Items (L1 RAM + L2 persistent SQLite disk cache) ---
 
 func (c *Cache) GetItems(serverKey, parentID string, dest interface{}) (bool, error) {
 	key := serverKey + "\x00" + parentID
 	now := time.Now().Unix()
+
+	// 1. Check in-memory L1 cache (ultra fast)
 	if v, ok := c.memItems.Load(key); ok {
 		e := v.(memEntry)
 		if e.expiresAt > now {
@@ -86,6 +105,21 @@ func (c *Cache) GetItems(serverKey, parentID string, dest interface{}) (bool, er
 		}
 		c.memItems.Delete(key)
 	}
+
+	// 2. Check SQLite persistent disk cache (persists across restarts!)
+	row := c.db.QueryRow(
+		`SELECT data, expires_at FROM items WHERE server_key=? AND parent_id=?`,
+		serverKey, parentID,
+	)
+	var data []byte
+	var expiresAt int64
+	if err := row.Scan(&data, &expiresAt); err == nil {
+		if expiresAt > now {
+			c.memItems.Store(key, memEntry{data: data, expiresAt: expiresAt})
+			return true, json.Unmarshal(data, dest)
+		}
+	}
+
 	return false, nil
 }
 
@@ -95,15 +129,23 @@ func (c *Cache) StoreItems(serverKey, parentID string, items interface{}) error 
 		return err
 	}
 	key := serverKey + "\x00" + parentID
-	c.memItems.Store(key, memEntry{data: data, expiresAt: time.Now().Add(c.ttlItems).Unix()})
-	return nil
+	expiresAt := time.Now().Add(c.ttlItems).Unix()
+
+	c.memItems.Store(key, memEntry{data: data, expiresAt: expiresAt})
+
+	_, err = c.db.Exec(
+		`INSERT OR REPLACE INTO items (server_key, parent_id, data, expires_at) VALUES (?,?,?,?)`,
+		serverKey, parentID, data, expiresAt,
+	)
+	return err
 }
 
-// --- Metadata (in-memory only) ---
+// --- Metadata (L1 RAM + L2 persistent SQLite disk cache) ---
 
 func (c *Cache) GetMetadata(serverKey, itemID string, dest interface{}) (bool, error) {
 	key := serverKey + "\x00" + itemID
 	now := time.Now().Unix()
+
 	if v, ok := c.memMeta.Load(key); ok {
 		e := v.(memEntry)
 		if e.expiresAt > now {
@@ -111,6 +153,20 @@ func (c *Cache) GetMetadata(serverKey, itemID string, dest interface{}) (bool, e
 		}
 		c.memMeta.Delete(key)
 	}
+
+	row := c.db.QueryRow(
+		`SELECT data, expires_at FROM metadata WHERE server_key=? AND item_id=?`,
+		serverKey, itemID,
+	)
+	var data []byte
+	var expiresAt int64
+	if err := row.Scan(&data, &expiresAt); err == nil {
+		if expiresAt > now {
+			c.memMeta.Store(key, memEntry{data: data, expiresAt: expiresAt})
+			return true, json.Unmarshal(data, dest)
+		}
+	}
+
 	return false, nil
 }
 
@@ -120,8 +176,15 @@ func (c *Cache) StoreMetadata(serverKey, itemID string, meta interface{}) error 
 		return err
 	}
 	key := serverKey + "\x00" + itemID
-	c.memMeta.Store(key, memEntry{data: data, expiresAt: time.Now().Add(c.ttlMetadata).Unix()})
-	return nil
+	expiresAt := time.Now().Add(c.ttlMetadata).Unix()
+
+	c.memMeta.Store(key, memEntry{data: data, expiresAt: expiresAt})
+
+	_, err = c.db.Exec(
+		`INSERT OR REPLACE INTO metadata (server_key, item_id, data, expires_at) VALUES (?,?,?,?)`,
+		serverKey, itemID, data, expiresAt,
+	)
+	return err
 }
 
 // --- Artwork (SQLite — persisted across restarts) ---
@@ -159,6 +222,8 @@ func (c *Cache) Invalidate(serverKey string) error {
 			return true
 		})
 	}
+	_, _ = c.db.Exec(`DELETE FROM items WHERE server_key=?`, serverKey)
+	_, _ = c.db.Exec(`DELETE FROM metadata WHERE server_key=?`, serverKey)
 	_, err := c.db.Exec(`DELETE FROM artwork WHERE server_key=?`, serverKey)
 	return err
 }
@@ -172,6 +237,7 @@ func (c *Cache) InvalidateItems(serverKey string) {
 		}
 		return true
 	})
+	_, _ = c.db.Exec(`DELETE FROM items WHERE server_key=?`, serverKey)
 }
 
 // ItemsTTL returns the configured TTL for item listings.

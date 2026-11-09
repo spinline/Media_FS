@@ -78,9 +78,9 @@ func DefaultConfig() *Config {
 			CacheTTLMin:    120,
 		},
 		Cache: CacheConfig{
-			TTLItemsSec:   300,
-			TTLMetaSec:    3600,
-			TTLArtworkSec: 86400,
+			TTLItemsSec:   604800,  // 7 gün (varsayılan: 604800s)
+			TTLMetaSec:    2592000, // 30 gün
+			TTLArtworkSec: 2592000, // 30 gün
 		},
 	}
 }
@@ -194,6 +194,16 @@ func applyEnvOverrides(cfg *Config) {
 	if v := getEnvAny("MEDIAFS_CACHE_TTL_MIN", "CACHE_TTL_MIN"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Download.CacheTTLMin = n
+		}
+	}
+	if v := getEnvAny("TTL_ITEMS_SEC", "CACHE_TTL_ITEMS_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Cache.TTLItemsSec = n
+		}
+	}
+	if v := getEnvAny("TTL_META_SEC", "CACHE_TTL_META_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Cache.TTLMetaSec = n
 		}
 	}
 }
