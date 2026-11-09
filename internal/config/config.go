@@ -51,9 +51,10 @@ type CacheConfig struct {
 }
 
 type MountConfig struct {
-	DriveLetter string `yaml:"drive_letter"`      // Windows
-	MountPoint  string `yaml:"mount_point"`       // Linux
-	Options     string `yaml:"options,omitempty"` // Linux FUSE options (e.g. "ro,allow_other")
+	DriveLetter     string `yaml:"drive_letter"`      // Windows
+	MountPoint      string `yaml:"mount_point"`       // Linux
+	Options         string `yaml:"options,omitempty"` // Linux FUSE options (e.g. "ro,allow_other")
+	VirtualSidecars bool   `yaml:"virtual_sidecars"`  // Generate .nfo and artwork sidecars
 }
 
 type Config struct {
@@ -128,6 +129,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := getEnvAny("MEDIAFS_DRIVE_LETTER", "DRIVE_LETTER"); v != "" {
 		cfg.Mount.DriveLetter = v
+	}
+	if v := getEnvAny("MEDIAFS_VIRTUAL_SIDECARS", "VIRTUAL_SIDECARS"); v != "" {
+		cfg.Mount.VirtualSidecars = strings.EqualFold(v, "true") || v == "1"
 	}
 
 	jellyURL := getEnvAny("JELLYFIN_URL", "MEDIAFS_JELLYFIN_URL")

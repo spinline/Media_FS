@@ -65,6 +65,7 @@ func runTray() {
 	defer dl.WindowCache.Close()
 
 	fs := vfs.New(cacheInst, dl)
+	fs.SetVirtualSidecars(cfg.Mount.VirtualSidecars)
 
 	// Start web config UI
 	webSrv, err := webui.New(cfg, func(newCfg *config.Config) error {
@@ -242,6 +243,7 @@ func runMount(keys []string) {
 	defer dl.WindowCache.Close()
 
 	fs := vfs.New(cacheInst, dl)
+	fs.SetVirtualSidecars(cfg.Mount.VirtualSidecars)
 
 	targets := keys
 	if len(targets) == 0 {

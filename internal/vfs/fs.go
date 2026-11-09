@@ -56,6 +56,29 @@ type MediaFS struct {
 	// This avoids JSON-unmarshalling the full library on every Getattr call.
 	decodedItems    sync.Map
 	decodedItemsTTL int64 // seconds, derived from cache.ItemsTTL()
+
+	// virtualSidecars controls whether virtual .nfo and artwork files are exposed.
+	virtualSidecars bool
+
+	// dirCache caches the full []dirEntry slice for a directory path for 30s
+	// so that subsequent Readdir offset calls (paging) and rapid re-browsing
+	// return instantaneously without re-traversing or querying thousands of items.
+	dirCache sync.Map // path(string) → dirListing
+}
+
+type dirEntry struct {
+	name string
+	stat *fuse.Stat_t
+}
+
+type dirListing struct {
+	expiresAt int64 // unix timestamp (seconds)
+	entries   []dirEntry
+}
+
+// SetVirtualSidecars enables or disables virtual .nfo and artwork sidecar files.
+func (fs *MediaFS) SetVirtualSidecars(enabled bool) {
+	fs.virtualSidecars = enabled
 }
 
 type fileHandle struct {
@@ -129,6 +152,9 @@ func (fs *MediaFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 
 	// Virtual .nfo sidecar: check before general resolution
 	if strings.HasSuffix(parts[len(parts)-1], ".nfo") {
+		if !fs.virtualSidecars {
+			return -fuse.ENOENT
+		}
 		item, err := fs.resolveNFOItem(parts)
 		if err != nil || item == nil {
 			return -fuse.ENOENT
@@ -138,21 +164,16 @@ func (fs *MediaFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 		if cached, ok := fs.nfoCache.Load(path); ok {
 			stat.Size = int64(len(cached.([]byte)))
 		} else {
-			// Generate eagerly so stat returns the exact size on first call.
-			// Open() will serve from cache and skip regeneration.
-			content, genErr := fs.generateNFO(parts[0], item)
-			if genErr == nil {
-				fs.nfoCache.Store(path, content)
-				stat.Size = int64(len(content))
-			} else {
-				stat.Size = 4096 // fallback if server unreachable
-			}
+			stat.Size = 4096 // fast fallback; content generated on Open()
 		}
 		return 0
 	}
 
 	// Virtual artwork sidecar
 	if _, _, ok := splitArtworkName(parts[len(parts)-1]); ok {
+		if !fs.virtualSidecars {
+			return -fuse.ENOENT
+		}
 		item, artType, err := fs.resolveArtworkItem(parts)
 		if err != nil || item == nil {
 			return -fuse.ENOENT
@@ -162,15 +183,7 @@ func (fs *MediaFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 		if data, ok, _ := fs.cache.GetArtwork(parts[0], item.ID, string(artType)); ok {
 			stat.Size = int64(len(data))
 		} else {
-			// Fetch eagerly so stat() returns exact size on first call.
-			// Fixes Explorer thumbnail corruption caused by truncated JPEG reads.
-			// Open() will serve from the warm cache without re-fetching.
-			data, fetchErr := fs.fetchArtwork(parts[0], item, artType)
-			if fetchErr == nil && data != nil {
-				stat.Size = int64(len(data))
-			} else {
-				stat.Size = 51200 // fallback if server unreachable or 404
-			}
+			stat.Size = 51200 // fast fallback; image fetched on Open()
 		}
 		return 0
 	}
@@ -201,16 +214,6 @@ func (fs *MediaFS) Getattr(path string, stat *fuse.Stat_t, fh uint64) int {
 			if stat.Size == 0 && meta.FileSize > 0 {
 				stat.Size = meta.FileSize
 			}
-		} else {
-			srv := fs.serverForKey(parts[0])
-			if srv != nil {
-				go func(srvKey, itemID string) {
-					m, err := srv.Conn.GetItemMetadata(itemID)
-					if err == nil {
-						_ = fs.cache.StoreMetadata(srvKey, itemID, m)
-					}
-				}(parts[0], item.ID)
-			}
 		}
 		setTimestamps(stat, item.DateAdded, premiereDate, productionYear)
 	}
@@ -224,84 +227,90 @@ func (fs *MediaFS) Readdir(path string,
 	parts := splitPath(path)
 	log.Printf("[vfs] Readdir %q (depth=%d, ofst=%d)", path, len(parts), ofst)
 
-	type dirEntry struct {
-		name string
-		stat *fuse.Stat_t
+	var entries []dirEntry
+	now := time.Now().Unix()
+
+	if v, ok := fs.dirCache.Load(path); ok {
+		dl := v.(dirListing)
+		if dl.expiresAt > now {
+			entries = dl.entries
+		}
 	}
 
-	var entries []dirEntry
-	entries = append(entries,
-		dirEntry{name: ".", stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2}},
-		dirEntry{name: "..", stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2}},
-	)
+	if entries == nil {
+		entries = append(entries,
+			dirEntry{name: ".", stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2}},
+			dirEntry{name: "..", stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2}},
+		)
 
-	if len(parts) == 0 {
-		// Root: list all server keys
-		fs.mu.RLock()
-		for key := range fs.servers {
-			entries = append(entries, dirEntry{
-				name: key,
-				stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2},
-			})
-		}
-		fs.mu.RUnlock()
-	} else if len(parts) == 1 {
-		// List libraries for this server
-		fs.mu.RLock()
-		srv, ok := fs.servers[parts[0]]
-		fs.mu.RUnlock()
-		if !ok {
-			log.Printf("[vfs] server %q not found", parts[0])
-			return -fuse.ENOENT
-		}
-		for _, lib := range srv.Libraries {
-			entries = append(entries, dirEntry{
-				name: lib.Name,
-				stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2},
-			})
-		}
-	} else {
-		// List items under a library/folder
-		items, err := fs.listItems(parts)
-		if err != nil {
-			log.Printf("[vfs] listItems %q error: %v", path, err)
-			return -fuse.EIO
-		}
-		for _, it := range items {
-			st := &fuse.Stat_t{}
-			if it.IsFolder {
-				st.Mode = fuse.S_IFDIR | 0555
-				st.Nlink = 2
-			} else {
-				st.Mode = fuse.S_IFREG | 0444
-				st.Size = it.FileSize
-			}
-			entries = append(entries, dirEntry{name: it.VFSName(), stat: st})
-
-			if !it.IsFolder {
-				base := strings.TrimSuffix(it.VFSName(), it.Extension)
-				nfoSize := int64(1024)
-				if cached, ok := fs.nfoCache.Load(path + "/" + base + ".nfo"); ok {
-					nfoSize = int64(len(cached.([]byte)))
-				}
+		if len(parts) == 0 {
+			// Root: list all server keys
+			fs.mu.RLock()
+			for key := range fs.servers {
 				entries = append(entries, dirEntry{
-					name: base + ".nfo",
-					stat: &fuse.Stat_t{Mode: fuse.S_IFREG | 0444, Size: nfoSize},
+					name: key,
+					stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2},
 				})
-				for _, artFile := range connector.ArtworkFilenames(it.Type) {
-					artSize := int64(51200)
-					if artType, ok := connector.ArtworkTypeForFilename(artFile); ok {
-						if data, cached, _ := fs.cache.GetArtwork(parts[0], it.ID, string(artType)); cached {
-							artSize = int64(len(data))
-						}
+			}
+			fs.mu.RUnlock()
+		} else if len(parts) == 1 {
+			// List libraries for this server
+			fs.mu.RLock()
+			srv, ok := fs.servers[parts[0]]
+			fs.mu.RUnlock()
+			if !ok {
+				log.Printf("[vfs] server %q not found", parts[0])
+				return -fuse.ENOENT
+			}
+			for _, lib := range srv.Libraries {
+				entries = append(entries, dirEntry{
+					name: lib.Name,
+					stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2},
+				})
+			}
+		} else {
+			// List items under a library/folder
+			items, err := fs.listItems(parts)
+			if err != nil {
+				log.Printf("[vfs] listItems %q error: %v", path, err)
+				return -fuse.EIO
+			}
+			for _, it := range items {
+				st := &fuse.Stat_t{}
+				if it.IsFolder {
+					st.Mode = fuse.S_IFDIR | 0555
+					st.Nlink = 2
+				} else {
+					st.Mode = fuse.S_IFREG | 0444
+					st.Size = it.FileSize
+				}
+				entries = append(entries, dirEntry{name: it.VFSName(), stat: st})
+
+				if !it.IsFolder && fs.virtualSidecars {
+					base := strings.TrimSuffix(it.VFSName(), it.Extension)
+					nfoSize := int64(1024)
+					if cached, ok := fs.nfoCache.Load(path + "/" + base + ".nfo"); ok {
+						nfoSize = int64(len(cached.([]byte)))
 					}
 					entries = append(entries, dirEntry{
-						name: base + "-" + artFile,
-						stat: &fuse.Stat_t{Mode: fuse.S_IFREG | 0444, Size: artSize},
+						name: base + ".nfo",
+						stat: &fuse.Stat_t{Mode: fuse.S_IFREG | 0444, Size: nfoSize},
 					})
+					for _, artFile := range connector.ArtworkFilenames(it.Type) {
+						entries = append(entries, dirEntry{
+							name: base + "-" + artFile,
+							stat: &fuse.Stat_t{Mode: fuse.S_IFREG | 0444, Size: 51200},
+						})
+					}
 				}
 			}
 		}
+
+		// Cache directory entries for 30 seconds so all subsequent Readdir offset calls (and rapid re-browsing) are instantaneous
+		fs.dirCache.Store(path, dirListing{
+			expiresAt: now + 30,
+			entries:   entries,
+		})
 	}
 
 	for i := int(ofst); i < len(entries); i++ {
@@ -325,6 +334,9 @@ func (fs *MediaFS) Open(path string, flags int) (int, uint64) {
 
 	// Virtual artwork sidecar
 	if _, _, ok := splitArtworkName(parts[len(parts)-1]); ok {
+		if !fs.virtualSidecars {
+			return -fuse.ENOENT, ^uint64(0)
+		}
 		item, artType, err := fs.resolveArtworkItem(parts)
 		if err != nil || item == nil {
 			return -fuse.ENOENT, ^uint64(0)
@@ -349,6 +361,9 @@ func (fs *MediaFS) Open(path string, flags int) (int, uint64) {
 
 	// Virtual .nfo sidecar
 	if strings.HasSuffix(parts[len(parts)-1], ".nfo") {
+		if !fs.virtualSidecars {
+			return -fuse.ENOENT, ^uint64(0)
+		}
 		item, err := fs.resolveNFOItem(parts)
 		if err != nil {
 			log.Printf("[vfs] NFO resolveItem error %s: %v", path, err)

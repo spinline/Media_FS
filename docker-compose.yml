@@ -32,6 +32,7 @@ services:
       - CACHE_TTL_MIN=${CACHE_TTL_MIN:-30}
       - TTL_ITEMS_SEC=${TTL_ITEMS_SEC:-604800}
       - TTL_META_SEC=${TTL_META_SEC:-2592000}
+      - VIRTUAL_SIDECARS=${VIRTUAL_SIDECARS:-false}
 
     # Mount Propagation (FUSE bağlamının NAS ana makinesinde görünmesi için rshared şarttır)
     volumes:
