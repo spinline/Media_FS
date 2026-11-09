@@ -71,11 +71,11 @@ func DefaultConfig() *Config {
 			Options:     "ro,allow_other",
 		},
 		Download: DownloadConfig{
-			ParallelChunks: 4,
-			ChunkSizeMB:    64,
+			ParallelChunks: 2,
+			ChunkSizeMB:    16,
 			BufferSizeKB:   256,
-			MaxCacheMB:     2048,
-			CacheTTLMin:    120,
+			MaxCacheMB:     512,
+			CacheTTLMin:    30,
 		},
 		Cache: CacheConfig{
 			TTLItemsSec:   604800,  // 7 gün (varsayılan: 604800s)

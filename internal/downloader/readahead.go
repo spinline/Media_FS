@@ -47,15 +47,17 @@ type ReadAheadReader struct {
 	active []*CachedWindow // windows currently tracked by this reader
 }
 
-// NewReadAheadReader creates a reader and pre-fetches the first window.
+// NewReadAheadReader creates a reader. Window fetching is performed on-demand
+// during ReadAt, avoiding heavy memory consumption when files are only probed
+// by scanners, thumbnailers, or file managers.
 func NewReadAheadReader(url string, headers map[string]string, fileSize int64, dl *Downloader, windowSizeMB, maxActive int) *ReadAheadReader {
 	if windowSizeMB <= 0 {
-		windowSizeMB = 64
+		windowSizeMB = 16
 	}
 	if maxActive <= 0 {
 		maxActive = 2
 	}
-	r := &ReadAheadReader{
+	return &ReadAheadReader{
 		url:        url,
 		headers:    headers,
 		fileSize:   fileSize,
@@ -63,19 +65,6 @@ func NewReadAheadReader(url string, headers map[string]string, fileSize int64, d
 		windowSize: int64(windowSizeMB) * 1024 * 1024,
 		maxActive:  maxActive,
 	}
-	// Pre-fetch the first maxActive windows + the last window in parallel.
-	// Media players (VLC, MPV…) read the end of the file immediately to load
-	// the index (MP4 moov atom, MKV cues…), so having it ready avoids a stall.
-	r.mu.Lock()
-	for i := 0; i < maxActive; i++ {
-		r.ensureWindowLocked(int64(i) * r.windowSize)
-	}
-	if r.fileSize > 0 {
-		lastWindowStart := ((r.fileSize - 1) / r.windowSize) * r.windowSize
-		r.ensureWindowLocked(lastWindowStart) // no-op if already covered above
-	}
-	r.mu.Unlock()
-	return r
 }
 
 // WindowSize returns the configured window size in bytes.
@@ -127,10 +116,15 @@ func (r *ReadAheadReader) ReadAt(buf []byte, offset int64) (int, error) {
 	}
 	n := copy(buf[:length], w.data[winOffset:])
 
-	// At 75% of window: prefetch the window maxActive steps ahead to keep the pipeline full.
-	if offset >= w.Start+(w.Size*3/4) {
+	// At 50% of window: prefetch up to maxActive upcoming windows to keep playback seamless.
+	if offset >= w.Start+(w.Size/2) {
 		r.mu.Lock()
-		r.ensureWindowLocked(alignedStart + int64(r.maxActive)*r.windowSize)
+		for step := int64(1); step <= int64(r.maxActive); step++ {
+			nextWin := alignedStart + step*r.windowSize
+			if nextWin < r.fileSize {
+				r.ensureWindowLocked(nextWin)
+			}
+		}
 		r.mu.Unlock()
 	}
 	return n, nil
