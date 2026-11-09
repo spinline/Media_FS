@@ -8,7 +8,10 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/CCoupel/Media_FS/internal/config"
@@ -27,6 +30,10 @@ type Client struct {
 	apiKey     string
 	userID     string
 	authHeader string // header name: X-MediaBrowser-Token (Jellyfin) or X-Emby-Token (Emby)
+	username   string
+	password   string
+	deviceID   string
+	mu         sync.Mutex
 	http       *http.Client
 }
 
@@ -38,10 +45,30 @@ func (c *Client) SetAuthHeader(header string) {
 
 func (c *Client) Connect(cfg config.ServerConfig) error {
 	c.baseURL = cfg.URL
+	c.username = cfg.Username
+	c.password = cfg.Password
 	if c.authHeader == "" {
 		c.authHeader = "X-MediaBrowser-Token" // Emby overrides this before calling Connect
 	}
-	c.http = &http.Client{Timeout: 15 * time.Second}
+	if c.deviceID == "" {
+		if devID := os.Getenv("JELLYFIN_DEVICE_ID"); devID != "" {
+			c.deviceID = devID
+		} else {
+			h, _ := os.Hostname()
+			if h == "" {
+				h = "mediafs"
+			}
+			c.deviceID = fmt.Sprintf("mediafs-%s", h)
+		}
+	}
+
+	timeout := 60 * time.Second
+	if tStr := os.Getenv("JELLYFIN_TIMEOUT_SEC"); tStr != "" {
+		if t, err := strconv.Atoi(tStr); err == nil && t > 0 {
+			timeout = time.Duration(t) * time.Second
+		}
+	}
+	c.http = &http.Client{Timeout: timeout}
 
 	if cfg.APIKey != "" {
 		log.Printf("[jellyfin] connecting %s via API key, username=%q", cfg.URL, cfg.Username)
@@ -112,59 +139,83 @@ func (c *Client) GetItems(libraryID, parentID string) ([]connector.MediaItem, er
 		parent = parentID
 	}
 
-	params := url.Values{
-		"ParentId": {parent},
-		"Fields":   {"MediaSources,DateCreated"},
-		"SortBy":   {"SortName"},
-		"SortOrder": {"Ascending"},
-	}
-	resp, err := c.get(fmt.Sprintf("/Users/%s/Items", c.userID), params)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	const pageSize = 500
+	startIndex := 0
+	var allItems []connector.MediaItem
 
+	for {
+		params := url.Values{
+			"ParentId":   {parent},
+			"Fields":     {"MediaSources,DateCreated"},
+			"SortBy":     {"SortName"},
+			"SortOrder":  {"Ascending"},
+			"StartIndex": {strconv.Itoa(startIndex)},
+			"Limit":      {strconv.Itoa(pageSize)},
+		}
+		resp, err := c.get(fmt.Sprintf("/Users/%s/Items", c.userID), params)
+		if err != nil {
+			return nil, err
+		}
 
-	var result struct {
-		Items []struct {
-			ID           string `json:"Id"`
-			ParentID     string `json:"ParentId"`
-			Name         string `json:"Name"`
-			Type         string `json:"Type"`
-			IsFolder     bool   `json:"IsFolder"`
-			DateCreated  string `json:"DateCreated"`
-			MediaSources []struct {
-				Size      int64  `json:"Size"`
-				Container string `json:"Container"`
-			} `json:"MediaSources"`
-		} `json:"Items"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, err
-	}
+		var result struct {
+			TotalRecordCount int `json:"TotalRecordCount"`
+			Items            []struct {
+				ID           string `json:"Id"`
+				ParentID     string `json:"ParentId"`
+				Name         string `json:"Name"`
+				Type         string `json:"Type"`
+				IsFolder     bool   `json:"IsFolder"`
+				DateCreated  string `json:"DateCreated"`
+				MediaSources []struct {
+					Size      int64  `json:"Size"`
+					Container string `json:"Container"`
+				} `json:"MediaSources"`
+			} `json:"Items"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
 
-	items := make([]connector.MediaItem, len(result.Items))
-	for i, it := range result.Items {
-		var size int64
-		var ext string
-		if len(it.MediaSources) > 0 {
-			size = it.MediaSources[0].Size
-			if c := strings.ToLower(it.MediaSources[0].Container); c != "" {
-				ext = "." + c
+		if len(result.Items) == 0 {
+			break
+		}
+
+		for _, it := range result.Items {
+			var size int64
+			var ext string
+			if len(it.MediaSources) > 0 {
+				size = it.MediaSources[0].Size
+				if c := strings.ToLower(it.MediaSources[0].Container); c != "" {
+					ext = "." + c
+				}
+			}
+			allItems = append(allItems, connector.MediaItem{
+				ID:        it.ID,
+				ParentID:  it.ParentID,
+				Name:      it.Name,
+				Type:      connector.ItemType(it.Type),
+				IsFolder:  it.IsFolder,
+				FileSize:  size,
+				DateAdded: it.DateCreated,
+				Extension: ext,
+			})
+		}
+
+		startIndex += len(result.Items)
+		if result.TotalRecordCount > 0 {
+			log.Printf("[jellyfin] GetItems progress: %d/%d items loaded (parent=%s)", len(allItems), result.TotalRecordCount, parent)
+			if startIndex >= result.TotalRecordCount {
+				break
 			}
 		}
-		items[i] = connector.MediaItem{
-			ID:        it.ID,
-			ParentID:  it.ParentID,
-			Name:      it.Name,
-			Type:      connector.ItemType(it.Type),
-			IsFolder:  it.IsFolder,
-			FileSize:  size,
-			DateAdded: it.DateCreated,
-			Extension: ext,
+		if len(result.Items) < pageSize {
+			break
 		}
 	}
-	return items, nil
+
+	return allItems, nil
 }
 
 func (c *Client) GetItemMetadata(itemID string) (connector.ItemMetadata, error) {
@@ -254,27 +305,53 @@ func (c *Client) GetFileSize(itemID string) (int64, error) {
 // --- internal helpers ---
 
 func (c *Client) get(path string, params url.Values) (*http.Response, error) {
+	return c.getWithRetry(path, params, true)
+}
+
+func (c *Client) getWithRetry(path string, params url.Values, canRetry bool) (*http.Response, error) {
 	if params == nil {
 		params = url.Values{}
 	}
+	c.mu.Lock()
+	apiKey := c.apiKey
+	deviceID := c.deviceID
+	c.mu.Unlock()
+
 	// api_key query param: universally supported by Emby and Jellyfin
-	params.Set("api_key", c.apiKey)
-	u := c.baseURL + path + "?" + params.Encode()
+	pCopy := url.Values{}
+	for k, v := range params {
+		pCopy[k] = v
+	}
+	pCopy.Set("api_key", apiKey)
+	u := c.baseURL + path + "?" + pCopy.Encode()
 
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
 		return nil, err
 	}
 	// Set both header styles for maximum compatibility
-	req.Header.Set(c.authHeader, c.apiKey)
+	req.Header.Set(c.authHeader, apiKey)
 	req.Header.Set("Authorization",
-		fmt.Sprintf(`MediaBrowser Client="MediaFS", Device="MediaFS", DeviceId="mediafs-cli", Version="1.0", Token="%s"`, c.apiKey))
+		fmt.Sprintf(`MediaBrowser Client="MediaFS", Device="MediaFS", DeviceId="%s", Version="1.0", Token="%s"`, deviceID, apiKey))
 
 	log.Printf("[http] GET %s (auth header: %s)", path, c.authHeader)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == 401 && canRetry && c.password != "" {
+		resp.Body.Close()
+		log.Printf("[http] 401 received, attempting automatic re-authentication for user %q", c.username)
+		token, _, err := c.authenticateByPassword(c.username, c.password)
+		if err == nil {
+			c.mu.Lock()
+			c.apiKey = token
+			c.mu.Unlock()
+			return c.getWithRetry(path, params, false)
+		}
+		log.Printf("[http] re-authentication failed: %v", err)
+		return nil, fmt.Errorf("%s → HTTP 401 (re-auth failed: %w)", path, err)
 	}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
@@ -293,7 +370,13 @@ func (c *Client) authenticateByPassword(username, password string) (string, stri
 		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	authVal := `MediaBrowser Client="MediaFS", Device="MediaFS", DeviceId="mediafs-cli", Version="1.0"`
+	c.mu.Lock()
+	deviceID := c.deviceID
+	c.mu.Unlock()
+	if deviceID == "" {
+		deviceID = "mediafs-cli"
+	}
+	authVal := fmt.Sprintf(`MediaBrowser Client="MediaFS", Device="MediaFS", DeviceId="%s", Version="1.0"`, deviceID)
 	req.Header.Set("Authorization", authVal)
 	req.Header.Set("X-Emby-Authorization", authVal)
 
