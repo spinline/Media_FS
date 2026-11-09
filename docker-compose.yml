@@ -1,0 +1,50 @@
+version: "3.8"
+
+services:
+  mediafs-jellyfin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGETARCH: arm64
+    image: mediafs:arm64
+    container_name: mediafs-jellyfin
+    restart: unless-stopped
+
+    # FUSE ve çekirdek izinleri
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+
+    # Jellyfin ve Mount Ortam Değişkenleri (.env dosyasından okunur)
+    environment:
+      - JELLYFIN_URL=${JELLYFIN_URL}
+      - JELLYFIN_USERNAME=${JELLYFIN_USERNAME}
+      - JELLYFIN_PASSWORD=${JELLYFIN_PASSWORD}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY}
+      - JELLYFIN_ALIAS=${JELLYFIN_ALIAS:-Jellyfin}
+      - MOUNT_POINT=/mnt/jellyfin-remote
+      - MOUNT_OPTIONS=${MOUNT_OPTIONS:-ro,allow_other}
+      - CHUNK_SIZE_MB=${CHUNK_SIZE_MB:-64}
+      - PARALLEL_CHUNKS=${PARALLEL_CHUNKS:-4}
+      - MAX_CACHE_MB=${MAX_CACHE_MB:-2048}
+      - CACHE_TTL_MIN=${CACHE_TTL_MIN:-120}
+
+    # Mount Propagation (FUSE bağlamının NAS ana makinesinde görünmesi için rshared şarttır)
+    volumes:
+      - type: bind
+        source: ${HOST_MOUNT_POINT:-/mnt/jellyfin-remote}
+        target: /mnt/jellyfin-remote
+        bind:
+          propagation: rshared
+      - mediafs-config:/root/.config/mediafs
+      - mediafs-cache:/root/.cache/mediafs
+
+volumes:
+  mediafs-config:
+    driver: local
+  mediafs-cache:
+    driver: local

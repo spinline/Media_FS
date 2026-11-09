@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
@@ -50,8 +51,9 @@ type CacheConfig struct {
 }
 
 type MountConfig struct {
-	DriveLetter string `yaml:"drive_letter"` // Windows
-	MountPoint  string `yaml:"mount_point"`  // Linux
+	DriveLetter string `yaml:"drive_letter"`      // Windows
+	MountPoint  string `yaml:"mount_point"`       // Linux
+	Options     string `yaml:"options,omitempty"` // Linux FUSE options (e.g. "ro,allow_other")
 }
 
 type Config struct {
@@ -65,7 +67,8 @@ func DefaultConfig() *Config {
 	return &Config{
 		Mount: MountConfig{
 			DriveLetter: "Z",
-			MountPoint:  "/mnt/mediafs",
+			MountPoint:  "/mnt/jellyfin-remote",
+			Options:     "ro,allow_other",
 		},
 		Download: DownloadConfig{
 			ParallelChunks: 4,
@@ -83,6 +86,9 @@ func DefaultConfig() *Config {
 }
 
 func ConfigDir() string {
+	if d := getEnvAny("MEDIAFS_CONFIG_DIR", "CONFIG_DIR"); d != "" {
+		return d
+	}
 	if runtime.GOOS == "windows" {
 		return filepath.Join(os.Getenv("APPDATA"), "MediaFS")
 	}
@@ -91,24 +97,114 @@ func ConfigDir() string {
 }
 
 func ConfigPath() string {
+	if p := getEnvAny("MEDIAFS_CONFIG_PATH", "CONFIG_PATH"); p != "" {
+		return p
+	}
 	return filepath.Join(ConfigDir(), "config.yaml")
 }
 
 func Load() (*Config, error) {
 	path := ConfigPath()
 	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		cfg := DefaultConfig()
-		return cfg, nil
-	}
-	if err != nil {
-		return nil, err
-	}
 	cfg := DefaultConfig()
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	if err == nil {
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
+
+	applyEnvOverrides(cfg)
 	return cfg, nil
+}
+
+func applyEnvOverrides(cfg *Config) {
+	if v := getEnvAny("MEDIAFS_MOUNT_POINT", "MOUNT_POINT"); v != "" {
+		cfg.Mount.MountPoint = v
+	}
+	if v := getEnvAny("MEDIAFS_MOUNT_OPTIONS", "MOUNT_OPTIONS"); v != "" {
+		cfg.Mount.Options = v
+	}
+	if v := getEnvAny("MEDIAFS_DRIVE_LETTER", "DRIVE_LETTER"); v != "" {
+		cfg.Mount.DriveLetter = v
+	}
+
+	jellyURL := getEnvAny("JELLYFIN_URL", "MEDIAFS_JELLYFIN_URL")
+	if jellyURL != "" {
+		username := getEnvAny("JELLYFIN_USERNAME", "MEDIAFS_JELLYFIN_USERNAME")
+		password := getEnvAny("JELLYFIN_PASSWORD", "MEDIAFS_JELLYFIN_PASSWORD")
+		apiKey := getEnvAny("JELLYFIN_API_KEY", "MEDIAFS_JELLYFIN_API_KEY")
+		alias := getEnvAny("JELLYFIN_ALIAS", "MEDIAFS_JELLYFIN_ALIAS")
+		if alias == "" {
+			alias = "Jellyfin"
+		}
+
+		found := false
+		for i := range cfg.Servers {
+			if cfg.Servers[i].Type == ConnectorJellyfin && (cfg.Servers[i].URL == jellyURL || cfg.Servers[i].Alias == alias) {
+				cfg.Servers[i].URL = jellyURL
+				if username != "" {
+					cfg.Servers[i].Username = username
+				}
+				if password != "" {
+					cfg.Servers[i].Password = password
+				}
+				if apiKey != "" {
+					cfg.Servers[i].APIKey = apiKey
+				}
+				cfg.Servers[i].Enabled = true
+				found = true
+				break
+			}
+		}
+		if !found {
+			cfg.Servers = append(cfg.Servers, ServerConfig{
+				Alias:    alias,
+				Type:     ConnectorJellyfin,
+				URL:      jellyURL,
+				Username: username,
+				Password: password,
+				APIKey:   apiKey,
+				Enabled:  true,
+			})
+		}
+	}
+
+	if v := getEnvAny("MEDIAFS_PARALLEL_CHUNKS", "PARALLEL_CHUNKS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Download.ParallelChunks = n
+		}
+	}
+	if v := getEnvAny("MEDIAFS_CHUNK_SIZE_MB", "CHUNK_SIZE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Download.ChunkSizeMB = n
+		}
+	}
+	if v := getEnvAny("MEDIAFS_BUFFER_SIZE_KB", "BUFFER_SIZE_KB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Download.BufferSizeKB = n
+		}
+	}
+	if v := getEnvAny("MEDIAFS_MAX_CACHE_MB", "MAX_CACHE_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Download.MaxCacheMB = n
+		}
+	}
+	if v := getEnvAny("MEDIAFS_CACHE_TTL_MIN", "CACHE_TTL_MIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.Download.CacheTTLMin = n
+		}
+	}
+}
+
+func getEnvAny(keys ...string) string {
+	for _, k := range keys {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func (c *Config) Save() error {

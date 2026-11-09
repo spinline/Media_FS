@@ -111,13 +111,9 @@ func runTray() {
 	// Start VFS in background
 	go func() {
 		host := fuse.NewFileSystemHost(fs)
-		var args []string
-		if runtime.GOOS == "windows" {
-			args = []string{cfg.Mount.DriveLetter + ":"}
-		} else {
-			args = []string{cfg.Mount.MountPoint}
-		}
-		if !host.Mount("", args) {
+		mountPoint, mountOpts := buildMountParams(cfg)
+		log.Printf("Mounting at %s (options: %v)...", mountPoint, mountOpts)
+		if !host.Mount(mountPoint, mountOpts) {
 			log.Println("VFS mount failed")
 		}
 	}()
@@ -265,16 +261,24 @@ func runMount(keys []string) {
 	}
 
 	host := fuse.NewFileSystemHost(fs)
-	var mountArgs []string
-	if runtime.GOOS == "windows" {
-		mountArgs = []string{cfg.Mount.DriveLetter + ":"}
-	} else {
-		mountArgs = []string{cfg.Mount.MountPoint}
-	}
-	log.Printf("Mounting at %s (Ctrl+C to unmount)...", mountArgs[0])
-	if !host.Mount("", mountArgs) {
+	mountPoint, mountOpts := buildMountParams(cfg)
+	log.Printf("Mounting at %s (options: %v, Ctrl+C to unmount)...", mountPoint, mountOpts)
+	if !host.Mount(mountPoint, mountOpts) {
 		log.Fatal("VFS mount failed")
 	}
+}
+
+func buildMountParams(cfg *config.Config) (string, []string) {
+	if runtime.GOOS == "windows" {
+		return cfg.Mount.DriveLetter + ":", nil
+	}
+	mountPoint := cfg.Mount.MountPoint
+	_ = os.MkdirAll(mountPoint, 0755)
+	opts := cfg.Mount.Options
+	if opts == "" {
+		opts = "ro,allow_other"
+	}
+	return mountPoint, []string{"-o", opts}
 }
 
 func runStatus() {
