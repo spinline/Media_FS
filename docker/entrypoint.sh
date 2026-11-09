@@ -26,13 +26,7 @@ fi
 # 3. Create mountpoint directory if not exists
 mkdir -p "$MOUNT_DIR"
 
-# 4. Clean up any stale/zombie FUSE mount
-if mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
-  echo "[*] Önceki bağlantı noktası temizleniyor: $MOUNT_DIR"
-  fusermount -u -z "$MOUNT_DIR" 2>/dev/null || true
-fi
-
-# 5. Log Configuration (masking secret)
+# 4. Log Configuration (masking secret)
 echo "[+] Hedef Mount Dizini: $MOUNT_DIR"
 if [ -n "$JELLYFIN_URL" ]; then
   echo "[+] Jellyfin Sunucu: $JELLYFIN_URL"
