@@ -221,24 +221,31 @@ func (fs *MediaFS) Readdir(path string,
 	fill func(name string, stat *fuse.Stat_t, ofst int64) bool,
 	ofst int64, fh uint64) int {
 
-	fill(".", nil, 0)
-	fill("..", nil, 0)
-
 	parts := splitPath(path)
-	log.Printf("[vfs] Readdir %q (depth=%d)", path, len(parts))
+	log.Printf("[vfs] Readdir %q (depth=%d, ofst=%d)", path, len(parts), ofst)
+
+	type dirEntry struct {
+		name string
+		stat *fuse.Stat_t
+	}
+
+	var entries []dirEntry
+	entries = append(entries,
+		dirEntry{name: ".", stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2}},
+		dirEntry{name: "..", stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2}},
+	)
 
 	if len(parts) == 0 {
 		// Root: list all server keys
 		fs.mu.RLock()
-		defer fs.mu.RUnlock()
-		log.Printf("[vfs] root: %d servers", len(fs.servers))
 		for key := range fs.servers {
-			fill(key, &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2}, 0)
+			entries = append(entries, dirEntry{
+				name: key,
+				stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2},
+			})
 		}
-		return 0
-	}
-
-	if len(parts) == 1 {
+		fs.mu.RUnlock()
+	} else if len(parts) == 1 {
 		// List libraries for this server
 		fs.mu.RLock()
 		srv, ok := fs.servers[parts[0]]
@@ -247,50 +254,60 @@ func (fs *MediaFS) Readdir(path string,
 			log.Printf("[vfs] server %q not found", parts[0])
 			return -fuse.ENOENT
 		}
-		log.Printf("[vfs] server %q: %d libraries", parts[0], len(srv.Libraries))
 		for _, lib := range srv.Libraries {
-			fill(lib.Name, &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2}, 0)
+			entries = append(entries, dirEntry{
+				name: lib.Name,
+				stat: &fuse.Stat_t{Mode: fuse.S_IFDIR | 0555, Nlink: 2},
+			})
 		}
-		return 0
-	}
-
-	// List items under a library/folder
-	items, err := fs.listItems(parts)
-	if err != nil {
-		log.Printf("[vfs] listItems %q error: %v", path, err)
-		return -fuse.EIO
-	}
-	log.Printf("[vfs] listItems %q → %d items", path, len(items))
-	for _, it := range items {
-		st := &fuse.Stat_t{}
-		if it.IsFolder {
-			st.Mode = fuse.S_IFDIR | 0555
-			st.Nlink = 2
-		} else {
-			st.Mode = fuse.S_IFREG | 0444
-			st.Size = it.FileSize
+	} else {
+		// List items under a library/folder
+		items, err := fs.listItems(parts)
+		if err != nil {
+			log.Printf("[vfs] listItems %q error: %v", path, err)
+			return -fuse.EIO
 		}
-		fill(it.VFSName(), st, 0)
-
-		// Inject virtual sidecar files (.nfo + artwork) — only for leaf media
-		// files, not for folder items. Movie folders expose their sidecars
-		// inside the folder (next to the actual media file).
-		base := it.Name // sidecar base = title without extension
-		if !it.IsFolder {
-			nfoSize := int64(1024)
-			if cached, ok := fs.nfoCache.Load(path + "/" + base + ".nfo"); ok {
-				nfoSize = int64(len(cached.([]byte)))
+		for _, it := range items {
+			st := &fuse.Stat_t{}
+			if it.IsFolder {
+				st.Mode = fuse.S_IFDIR | 0555
+				st.Nlink = 2
+			} else {
+				st.Mode = fuse.S_IFREG | 0444
+				st.Size = it.FileSize
 			}
-			fill(base+".nfo", &fuse.Stat_t{Mode: fuse.S_IFREG | 0444, Size: nfoSize}, 0)
-			for _, artFile := range connector.ArtworkFilenames(it.Type) {
-				artSize := int64(51200)
-				if artType, ok := connector.ArtworkTypeForFilename(artFile); ok {
-					if data, cached, _ := fs.cache.GetArtwork(parts[0], it.ID, string(artType)); cached {
-						artSize = int64(len(data))
-					}
+			entries = append(entries, dirEntry{name: it.VFSName(), stat: st})
+
+			if !it.IsFolder {
+				base := strings.TrimSuffix(it.VFSName(), it.Extension)
+				nfoSize := int64(1024)
+				if cached, ok := fs.nfoCache.Load(path + "/" + base + ".nfo"); ok {
+					nfoSize = int64(len(cached.([]byte)))
 				}
-				fill(base+"-"+artFile, &fuse.Stat_t{Mode: fuse.S_IFREG | 0444, Size: artSize}, 0)
+				entries = append(entries, dirEntry{
+					name: base + ".nfo",
+					stat: &fuse.Stat_t{Mode: fuse.S_IFREG | 0444, Size: nfoSize},
+				})
+				for _, artFile := range connector.ArtworkFilenames(it.Type) {
+					artSize := int64(51200)
+					if artType, ok := connector.ArtworkTypeForFilename(artFile); ok {
+						if data, cached, _ := fs.cache.GetArtwork(parts[0], it.ID, string(artType)); cached {
+							artSize = int64(len(data))
+						}
+					}
+					entries = append(entries, dirEntry{
+						name: base + "-" + artFile,
+						stat: &fuse.Stat_t{Mode: fuse.S_IFREG | 0444, Size: artSize},
+					})
+				}
 			}
+		}
+	}
+
+	for i := int(ofst); i < len(entries); i++ {
+		nextOffset := int64(i + 1)
+		if !fill(entries[i].name, entries[i].stat, nextOffset) {
+			break
 		}
 	}
 	return 0
@@ -689,7 +706,7 @@ func (fs *MediaFS) resolveArtworkItem(parts []string) (*connector.MediaItem, con
 		if items[i].IsFolder {
 			continue // artwork lives inside the folder, not next to it
 		}
-		base := strings.TrimSuffix(items[i].Name, extensionOf(items[i].Name))
+		base := strings.TrimSuffix(items[i].VFSName(), items[i].Extension)
 		if base == itemBase {
 			return &items[i], artType, nil
 		}
@@ -750,7 +767,7 @@ func (fs *MediaFS) resolveNFOItem(parts []string) (*connector.MediaItem, error) 
 	}
 	for i := range items {
 		if !items[i].IsFolder {
-			base := strings.TrimSuffix(items[i].Name, extensionOf(items[i].Name))
+			base := strings.TrimSuffix(items[i].VFSName(), items[i].Extension)
 			if base == nfoBase {
 				return &items[i], nil
 			}
