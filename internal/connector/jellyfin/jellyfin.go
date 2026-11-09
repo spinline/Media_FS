@@ -293,8 +293,9 @@ func (c *Client) authenticateByPassword(username, password string) (string, stri
 		return "", "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Emby-Authorization",
-		`MediaBrowser Client="MediaFS", Device="MediaFS", DeviceId="mediafs-cli", Version="1.0"`)
+	authVal := `MediaBrowser Client="MediaFS", Device="MediaFS", DeviceId="mediafs-cli", Version="1.0"`
+	req.Header.Set("Authorization", authVal)
+	req.Header.Set("X-Emby-Authorization", authVal)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
