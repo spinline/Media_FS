@@ -124,6 +124,26 @@ sudo apt-get install -y libfuse-dev gcc   # fuse2 — cgofuse v1.6.0 uses pkg-co
 CGO_ENABLED=1 go build -o dist/mediafs ./cmd/mediafs
 ```
 
+## Docker Deployment (ARM64 / Linux NAS)
+
+Media_FS can run inside a Docker container with FUSE mount propagation (`rshared`) so the remote library appears directly on the host file system.
+
+1. Prepare host mount point:
+   ```bash
+   sudo ./scripts/init-host.sh /mnt/jellyfin-remote
+   ```
+2. Configure credentials in `.env`:
+   ```bash
+   cp .env.example .env
+   # Edit JELLYFIN_URL, JELLYFIN_USERNAME, JELLYFIN_PASSWORD
+   ```
+3. Start the container:
+   ```bash
+   docker compose up -d --build
+   ```
+
+The files will be available directly on the host at `/mnt/jellyfin-remote/`.
+
 ### Tests & lint
 
 ```bash
