@@ -5,7 +5,7 @@
 # ==============================================================================
 set -euo pipefail
 
-MOUNT_DIR="${1:-/mnt/jellyfin-remote}"
+MOUNT_DIR="${1:-/vol1/1000/Docker/mediafs}"
 
 echo ">>> Fygos NAS FUSE Mount Noktası Yapılandırılıyor: $MOUNT_DIR"
 
